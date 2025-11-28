@@ -1,3 +1,9 @@
+# remfab
+
+*R*ust r*eM*arkable 2 *f*ramebuffer *A*PI *b*indings.
+
+A (WIP) library to natively interact with the reMarkable 2 framebuffer.
+
 ## Reference
 
 ### reMarkable 2 framebuffer drivers

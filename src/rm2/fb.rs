@@ -1,56 +1,18 @@
-use std::{ffi::c_ulong, mem::MaybeUninit, num::NonZeroU16};
+use std::{
+    ffi::c_ulong,
+    fs::{self, File},
+    io,
+    mem::MaybeUninit,
+    num::NonZeroU16,
+    os::fd::AsRawFd as _,
+    path::PathBuf,
+};
 
-use nix::{errno::Errno, libc::c_int};
+use nix::errno::Errno;
 
-mod raw {
-    pub mod fb_type {
-        pub const PACKED_PIXELS: u32 = 0;
-        pub const PLANES: u32 = 1;
-        pub const INTERLEAVED_PLANES: u32 = 2;
-        pub const TEXT: u32 = 3;
-        pub const VGA_PLANES: u32 = 4;
-        pub const FOURCC: u32 = 5;
-    }
+use crate::rm2::sy7636a_temperature;
 
-    pub mod fb_aux_text {
-        pub const MDA: u32 = 0;
-        pub const CGA: u32 = 1;
-        pub const S3_MMIO: u32 = 2;
-        pub const MGA_STEP16: u32 = 3;
-        pub const MGA_STEP8: u32 = 4;
-        // pub const SVGA_GROUP: u32 = 8;
-        // pub const SVGA_MASK: u32 = 7;
-        pub const SVGA_STEP2: u32 = 8;
-        pub const SVGA_STEP4: u32 = 9;
-        pub const SVGA_STEP8: u32 = 10;
-        pub const SVGA_STEP16: u32 = 11;
-        // pub const SVGA_LAST: u32 = 15;
-    }
-
-    pub mod fb_aux_vga_planes {
-
-        pub const VGA4: u32 = 0;
-        pub const CFB4: u32 = 1;
-        pub const CFB8: u32 = 2;
-    }
-
-    pub mod fb_visual {
-        pub const MONO01: u32 = 0;
-        pub const MONO10: u32 = 1;
-        pub const TRUECOLOR: u32 = 2;
-        pub const PSEUDOCOLOR: u32 = 3;
-        pub const DIRECTCOLOR: u32 = 4;
-        pub const STATIC_PSEUDOCOLOR: u32 = 5;
-        pub const FOURCC: u32 = 6;
-    }
-
-    pub mod vesa {
-        pub const NO_BLANKING: i32 = 0;
-        pub const VSYNC_SUSPEND: i32 = 1;
-        pub const HSYNC_SUSPEND: i32 = 2;
-        pub const POWERDOWN: i32 = VSYNC_SUSPEND | HSYNC_SUSPEND;
-    }
-}
+use super::fb_sys::*;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TextType {
@@ -70,15 +32,15 @@ impl TryFrom<u32> for TextType {
 
     fn try_from(value: u32) -> Result<Self, Self::Error> {
         match value {
-            raw::fb_aux_text::MDA => Ok(TextType::MDA),
-            raw::fb_aux_text::CGA => Ok(TextType::CGA),
-            raw::fb_aux_text::S3_MMIO => Ok(TextType::S3MMIO),
-            raw::fb_aux_text::MGA_STEP16 => Ok(TextType::MGAStep16),
-            raw::fb_aux_text::MGA_STEP8 => Ok(TextType::MGAStep8),
-            raw::fb_aux_text::SVGA_STEP2 => Ok(TextType::SVGAStep2),
-            raw::fb_aux_text::SVGA_STEP4 => Ok(TextType::SVGAStep4),
-            raw::fb_aux_text::SVGA_STEP8 => Ok(TextType::SVGAStep8),
-            raw::fb_aux_text::SVGA_STEP16 => Ok(TextType::SVGAStep16),
+            fb_aux_text::MDA => Ok(TextType::MDA),
+            fb_aux_text::CGA => Ok(TextType::CGA),
+            fb_aux_text::S3_MMIO => Ok(TextType::S3MMIO),
+            fb_aux_text::MGA_STEP16 => Ok(TextType::MGAStep16),
+            fb_aux_text::MGA_STEP8 => Ok(TextType::MGAStep8),
+            fb_aux_text::SVGA_STEP2 => Ok(TextType::SVGAStep2),
+            fb_aux_text::SVGA_STEP4 => Ok(TextType::SVGAStep4),
+            fb_aux_text::SVGA_STEP8 => Ok(TextType::SVGAStep8),
+            fb_aux_text::SVGA_STEP16 => Ok(TextType::SVGAStep16),
             _ => Err(value),
         }
     }
@@ -96,9 +58,9 @@ impl TryFrom<u32> for VGAPlanesType {
 
     fn try_from(value: u32) -> Result<Self, Self::Error> {
         match value {
-            raw::fb_aux_vga_planes::VGA4 => Ok(VGAPlanesType::VGA4),
-            raw::fb_aux_vga_planes::CFB4 => Ok(VGAPlanesType::CFB4),
-            raw::fb_aux_vga_planes::CFB8 => Ok(VGAPlanesType::CFB8),
+            fb_aux_vga_planes::VGA4 => Ok(VGAPlanesType::VGA4),
+            fb_aux_vga_planes::CFB4 => Ok(VGAPlanesType::CFB4),
+            fb_aux_vga_planes::CFB8 => Ok(VGAPlanesType::CFB8),
             _ => Err(value),
         }
     }
@@ -119,16 +81,14 @@ impl TryFrom<(u32, u32)> for Type {
 
     fn try_from(value: (u32, u32)) -> Result<Self, Self::Error> {
         match value {
-            (raw::fb_type::PACKED_PIXELS, _) => Ok(Type::PackedPixels),
-            (raw::fb_type::PLANES, _) => Ok(Type::Planes),
-            (raw::fb_type::INTERLEAVED_PLANES, _) => Ok(Type::InterleavedPlanes),
-            (raw::fb_type::TEXT, text_type) => {
-                Ok(Type::Text(text_type.try_into().map_err(|_| value)?))
-            }
-            (raw::fb_type::VGA_PLANES, vga_planes_type) => Ok(Type::VGAPlanes(
+            (fb_type::PACKED_PIXELS, _) => Ok(Type::PackedPixels),
+            (fb_type::PLANES, _) => Ok(Type::Planes),
+            (fb_type::INTERLEAVED_PLANES, _) => Ok(Type::InterleavedPlanes),
+            (fb_type::TEXT, text_type) => Ok(Type::Text(text_type.try_into().map_err(|_| value)?)),
+            (fb_type::VGA_PLANES, vga_planes_type) => Ok(Type::VGAPlanes(
                 vga_planes_type.try_into().map_err(|_| value)?,
             )),
-            (raw::fb_type::FOURCC, _) => Ok(Type::FourCC),
+            (fb_type::FOURCC, _) => Ok(Type::FourCC),
             _ => Err(value),
         }
     }
@@ -150,13 +110,13 @@ impl TryFrom<u32> for Visual {
 
     fn try_from(value: u32) -> Result<Self, Self::Error> {
         match value {
-            raw::fb_visual::MONO01 => Ok(Visual::Mono01),
-            raw::fb_visual::MONO10 => Ok(Visual::Mono10),
-            raw::fb_visual::TRUECOLOR => Ok(Visual::TrueColor),
-            raw::fb_visual::PSEUDOCOLOR => Ok(Visual::PseudoColor),
-            raw::fb_visual::DIRECTCOLOR => Ok(Visual::DirectColor),
-            raw::fb_visual::STATIC_PSEUDOCOLOR => Ok(Visual::StaticPseudoColor),
-            raw::fb_visual::FOURCC => Ok(Visual::FourCC),
+            fb_visual::MONO01 => Ok(Visual::Mono01),
+            fb_visual::MONO10 => Ok(Visual::Mono10),
+            fb_visual::TRUECOLOR => Ok(Visual::TrueColor),
+            fb_visual::PSEUDOCOLOR => Ok(Visual::PseudoColor),
+            fb_visual::DIRECTCOLOR => Ok(Visual::DirectColor),
+            fb_visual::STATIC_PSEUDOCOLOR => Ok(Visual::StaticPseudoColor),
+            fb_visual::FOURCC => Ok(Visual::FourCC),
             _ => Err(value),
         }
     }
@@ -258,29 +218,24 @@ pub struct VariableScreenInfo {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BlankMode {
     /// Screen: unblanked, hsync: on, vsync: on
-    Unblank = raw::vesa::NO_BLANKING,
+    Unblank = vesa::NO_BLANKING,
 
     /// Screen: blanked, hsync: on, vsync: on
-    Normal = raw::vesa::NO_BLANKING + 1,
+    Normal = vesa::NO_BLANKING + 1,
 
     /// Screen: blanked, hsync: on, vsync: off
-    VSyncSuspend = raw::vesa::VSYNC_SUSPEND + 1,
+    VSyncSuspend = vesa::VSYNC_SUSPEND + 1,
 
     /// Screen: blanked, hsync: off, vsync: on
-    HSyncSuspend = raw::vesa::HSYNC_SUSPEND + 1,
+    HSyncSuspend = vesa::HSYNC_SUSPEND + 1,
 
     /// Screen: blanked, hsync: off, vsync: off
-    Powerdown = raw::vesa::POWERDOWN + 1,
+    Powerdown = vesa::POWERDOWN + 1,
 }
 
-mod ioctl {
+mod raw_ioctl {
+    use super::super::fb_sys::ioctl::*;
     use super::{FixedScreenInfo, VariableScreenInfo};
-
-    const FBIOGET_VSCREENINFO: u16 = 0x4600;
-    const FBIOPUT_VSCREENINFO: u16 = 0x4601;
-    const FBIOGET_FSCREENINFO: u16 = 0x4602;
-    const FBIOPAN_DISPLAY: u16 = 0x4606;
-    const FBIOBLANK: u16 = 0x4611;
 
     nix::ioctl_read_bad!(fbioget_vscreeninfo, FBIOGET_VSCREENINFO, VariableScreenInfo);
     nix::ioctl_write_ptr_bad!(fbioput_vscreeninfo, FBIOPUT_VSCREENINFO, VariableScreenInfo);
@@ -289,33 +244,111 @@ mod ioctl {
     nix::ioctl_write_int_bad!(fbioblank, FBIOBLANK);
 }
 
-pub fn get_variable_screen_info(fd: c_int) -> Result<VariableScreenInfo, Errno> {
+#[derive(Debug, thiserror::Error)]
+pub enum Error {
+    #[error("ioctl 0x{0:x} failed: {1}")]
+    Ioctl(u16, Errno),
+
+    #[error("failed to read temperature: {0}")]
+    Temperature(#[from] sy7636a_temperature::Error),
+}
+
+pub fn get_variable_screen_info(fd: &File) -> Result<VariableScreenInfo, Error> {
     let mut vscreeninfo = MaybeUninit::<VariableScreenInfo>::uninit();
 
-    unsafe { ioctl::fbioget_vscreeninfo(fd, vscreeninfo.as_mut_ptr()) }?;
+    unsafe { raw_ioctl::fbioget_vscreeninfo(fd.as_raw_fd(), vscreeninfo.as_mut_ptr()) }
+        .map_err(|errno| Error::Ioctl(ioctl::FBIOGET_VSCREENINFO, errno))?;
 
     Ok(unsafe { vscreeninfo.assume_init() })
 }
 
-pub fn set_variable_screen_info(fd: c_int, vscreeninfo: &VariableScreenInfo) -> Result<(), Errno> {
-    unsafe { ioctl::fbioput_vscreeninfo(fd, vscreeninfo) }?;
+pub fn set_variable_screen_info(fd: &File, vscreeninfo: &VariableScreenInfo) -> Result<(), Error> {
+    unsafe { raw_ioctl::fbioput_vscreeninfo(fd.as_raw_fd(), vscreeninfo) }
+        .map_err(|errno| Error::Ioctl(ioctl::FBIOPUT_VSCREENINFO, errno))?;
     Ok(())
 }
 
-pub fn get_fixed_screen_info(fd: c_int) -> Result<FixedScreenInfo, Errno> {
+pub fn get_fixed_screen_info(fd: &File) -> Result<FixedScreenInfo, Error> {
     let mut fscreeninfo = MaybeUninit::<FixedScreenInfo>::uninit();
 
-    unsafe { ioctl::fbioget_fscreeninfo(fd, fscreeninfo.as_mut_ptr()) }?;
+    unsafe { raw_ioctl::fbioget_fscreeninfo(fd.as_raw_fd(), fscreeninfo.as_mut_ptr()) }
+        .map_err(|errno| Error::Ioctl(ioctl::FBIOGET_FSCREENINFO, errno))?;
 
     Ok(unsafe { fscreeninfo.assume_init() })
 }
 
-pub fn pan_display(fd: c_int, vscreeninfo: &VariableScreenInfo) -> Result<(), Errno> {
-    unsafe { ioctl::fbiopan_display(fd, vscreeninfo) }?;
+pub fn pan_display(fd: &File, vscreeninfo: &VariableScreenInfo) -> Result<(), Error> {
+    unsafe { raw_ioctl::fbiopan_display(fd.as_raw_fd(), vscreeninfo) }
+        .map_err(|errno| Error::Ioctl(ioctl::FBIOPAN_DISPLAY, errno))?;
     Ok(())
 }
 
-pub fn set_blank_mode(fd: c_int, mode: BlankMode) -> Result<(), Errno> {
-    unsafe { ioctl::fbioblank(fd, mode as i32) }?;
+pub fn set_blank_mode(fd: &File, mode: BlankMode) -> Result<(), Error> {
+    unsafe { raw_ioctl::fbioblank(fd.as_raw_fd(), mode as i32) }
+        .map_err(|errno| Error::Ioctl(ioctl::FBIOBLANK, errno))?;
     Ok(())
+}
+
+#[derive(Debug)]
+pub struct Driver {
+    fd: File,
+    temperature_sensor: sy7636a_temperature::Sensor,
+    front_buffer_index: i32,
+    back_buffer_index: i32,
+    var_screen_info: VariableScreenInfo,
+}
+impl Driver {
+    pub fn start(&mut self) -> Result<(), Error> {
+        set_blank_mode(&self.fd, BlankMode::Unblank)?;
+
+        let temperature = self.temperature_sensor.read_temperature()?;
+
+        let fscreeninfo = get_fixed_screen_info(&self.fd)?;
+        let vscreeninfo = get_variable_screen_info(&self.fd)?;
+
+        self.var_screen_info = vscreeninfo;
+
+        Ok(())
+    }
+
+    pub fn page_flip(&mut self) -> Result<(), Error> {
+        // self.fb_var_info.yoffset = self.back_buffer_index * self.dims.height;
+
+        if self.front_buffer_index == -1 {
+            set_variable_screen_info(&self.fd, &self.var_screen_info)
+        } else {
+            pan_display(&self.fd, &self.var_screen_info)
+        }?;
+
+        self.front_buffer_index = self.back_buffer_index;
+        self.back_buffer_index = (self.back_buffer_index + 1) % 2;
+
+        Ok(())
+    }
+}
+
+const DEVICE_NAME: &[u8; 10] = b"mxs-lcdif\n";
+const GRAPHICS_PATH: &str = "/sys/class/graphics";
+
+pub fn discover_path() -> Result<Option<PathBuf>, io::Error> {
+    for entry in fs::read_dir(GRAPHICS_PATH)? {
+        let entry = entry?;
+
+        let dir_path = entry.path();
+        let name_path = dir_path.join("name");
+
+        if !fs::exists(&name_path)? {
+            continue;
+        }
+
+        if &fs::read(&name_path)? == DEVICE_NAME {
+            let mut dev_path = PathBuf::new();
+            dev_path.push("/dev");
+            dev_path.push(entry.file_name());
+
+            return Ok(Some(dev_path));
+        }
+    }
+
+    Ok(None)
 }

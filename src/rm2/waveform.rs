@@ -1,4 +1,7 @@
-use std::io::{self, Read, Seek};
+use std::{
+    io::{self, Read, Seek},
+    ops::Index,
+};
 
 use crate::byte_reader::*;
 
@@ -32,69 +35,6 @@ pub struct Header {
     pub sb: u8,
     pub checksum2: u8,
 }
-
-#[repr(u8)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Phase {
-    Noop = 0b00,
-    Black = 0b01,
-    White = 0b10,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct PhaseCell(u8);
-
-impl PhaseCell {
-    pub fn new(phases: u8) -> Result<Self, Error> {
-        if phases & 0b11000000 == 0b11000000
-            || phases & 0b00110000 == 0b00110000
-            || phases & 0b00001100 == 0b00001100
-            || phases & 0b00000011 == 0b00000011
-        {
-            Err(Error::InvalidPhase(phases))
-        } else {
-            Ok(PhaseCell(phases))
-        }
-    }
-
-    pub fn p1(&self) -> Phase {
-        match self.0 >> 6 {
-            0b00 => Phase::Noop,
-            0b01 => Phase::Black,
-            0b10 => Phase::White,
-            phase => unreachable!("invalid phase: 0b{phase:02b}"),
-        }
-    }
-
-    pub fn p2(&self) -> Phase {
-        match (self.0 >> 4) & 0b11 {
-            0b00 => Phase::Noop,
-            0b01 => Phase::Black,
-            0b10 => Phase::White,
-            phase => unreachable!("invalid phase: 0b{phase:02b}"),
-        }
-    }
-
-    pub fn p3(&self) -> Phase {
-        match (self.0 >> 2) & 0b11 {
-            0b00 => Phase::Noop,
-            0b01 => Phase::Black,
-            0b10 => Phase::White,
-            phase => unreachable!("invalid phase: 0b{phase:02b}"),
-        }
-    }
-
-    pub fn p4(&self) -> Phase {
-        match self.0 & 0b11 {
-            0b00 => Phase::Noop,
-            0b01 => Phase::Black,
-            0b10 => Phase::White,
-            phase => unreachable!("invalid phase: 0b{phase:02b}"),
-        }
-    }
-}
-
-const INTENSITY_VALUES: u8 = 1 << 5;
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -180,7 +120,11 @@ fn pointer<R: Read>(input: &mut R) -> Result<u32, Error> {
     let pointer = take_const(input)?;
     let checksum = u8(input)?;
 
-    let actual: u8 = pointer.iter().sum();
+    let actual: u8 = pointer[0]
+        .overflowing_add(pointer[1])
+        .0
+        .overflowing_add(pointer[2])
+        .0;
     if actual != checksum {
         return Err(Error::InvalidChecksum {
             field: "pointer".to_string(),
@@ -250,36 +194,111 @@ fn find_waveform_blocks<R: Read + Seek>(
     Ok(addresses)
 }
 
-// fn waveform<R: Read + Seek>(input: &mut R) -> Result<(), Error> {
-//     let mut repeat_mode = true;
+#[repr(u8)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Phase {
+    Noop = 0b00,
+    Black = 0b01,
+    White = 0b10,
+}
 
-//     let mut block = vec![];
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PhaseCell(u8);
 
-//     loop {
-//         let phases = u8(input)?;
+impl PhaseCell {
+    pub fn new(phases: u8) -> Result<Self, Error> {
+        if phases & 0b11000000 == 0b11000000
+            || phases & 0b00110000 == 0b00110000
+            || phases & 0b00001100 == 0b00001100
+            || phases & 0b00000011 == 0b00000011
+        {
+            Err(Error::InvalidPhase(phases))
+        } else {
+            Ok(PhaseCell(phases))
+        }
+    }
+}
 
-//         if phases == 0xFC {
-//             repeat_mode = !repeat_mode;
-//             continue;
-//         }
+impl Index<u8> for PhaseCell {
+    type Output = Phase;
 
-//         let mut repeat = 1;
+    fn index(&self, index: u8) -> &Self::Output {
+        if index > 3 {
+            panic!("index out of bounds for PhaseCell: {index}")
+        }
 
-//         if repeat_mode {
-//             repeat = u8(input)? + 1;
+        let shift = 6 - (2 * index);
 
-//             if phases == 0xFF {
-//                 break;
-//             }
-//         }
+        match (self.0 >> shift) & 0b11 {
+            0b00 => &Phase::Noop,
+            0b01 => &Phase::Black,
+            0b10 => &Phase::White,
+            phase => unreachable!("invalid phase: 0b{phase:02b}"),
+        }
+    }
+}
 
-//         let phase_cell = PhaseCell::new(phases)?;
+const INTENSITY_VALUES: usize = 1 << 5;
 
-//         for n in 0..repeat {}
-//     }
+type PhaseMatrix = Box<[[Phase; INTENSITY_VALUES]; INTENSITY_VALUES]>;
 
-//     Ok(())
-// }
+fn waveform<R: Read + Seek>(end: u64, input: &mut R) -> Result<Vec<PhaseMatrix>, Error> {
+    let mut block = vec![];
+
+    let mut matrix = Box::new([[Phase::Noop; INTENSITY_VALUES]; INTENSITY_VALUES]);
+
+    let mut i = 0;
+    let mut j = 0;
+    let mut repeat_mode = true;
+
+    loop {
+        let pos = input.seek(io::SeekFrom::Current(0))?;
+        if pos == end {
+            break;
+        }
+
+        let phases = u8(input)?;
+
+        if phases == 0xFC {
+            repeat_mode = !repeat_mode;
+            continue;
+        }
+
+        if phases == 0xFF {
+            break;
+        }
+
+        let mut repeat = 1;
+
+        if repeat_mode {
+            repeat = u8(input)? as u32 + 1;
+        }
+
+        let phase_cell = PhaseCell::new(phases)?;
+
+        for _ in 0..repeat {
+            matrix[j][i] = phase_cell[0];
+            matrix[j + 1][i] = phase_cell[1];
+            matrix[j + 2][i] = phase_cell[2];
+            matrix[j + 3][i] = phase_cell[3];
+
+            j += 4;
+
+            if j == INTENSITY_VALUES {
+                j = 0;
+                i += 1;
+            }
+
+            if i == INTENSITY_VALUES {
+                i = 0;
+                block.push(matrix);
+                matrix = Box::new([[Phase::Noop; INTENSITY_VALUES]; INTENSITY_VALUES])
+            }
+        }
+    }
+
+    Ok(block)
+}
 
 #[test]
 fn parse_pointer_test() {
@@ -290,4 +309,31 @@ fn parse_pointer_test() {
     let p = pointer(&mut input).unwrap();
 
     assert_eq!(p, 0x060505);
+}
+
+#[test]
+fn parse_test() {
+    use std::fs::File;
+    use std::io::SeekFrom;
+
+    let mut input = File::open("320_R467_AF4731_ED103TC2C6_VB3300-KCD_TC.wbf").unwrap();
+
+    let header = header(&mut input).unwrap();
+    let temperatures = temperatures(header.temp_range_count as usize, &mut input).unwrap();
+    let filename = filename(&mut input).unwrap();
+    let blocks = find_waveform_blocks(
+        header.mode_count as usize,
+        header.temp_range_count as usize,
+        &mut input,
+    )
+    .unwrap();
+
+    input.seek(SeekFrom::Start(blocks[0] as u64)).unwrap();
+    let end = blocks[1] as u64;
+    let waveform = waveform(end, &mut input).unwrap();
+
+    println!("{:?}", waveform.last().unwrap());
+    println!("{:#?}", waveform.len());
+
+    assert!(false);
 }

@@ -297,6 +297,7 @@ pub struct Driver {
     back_buffer_index: i32,
     var_screen_info: VariableScreenInfo,
 }
+
 impl Driver {
     pub fn start(&mut self) -> Result<(), Error> {
         set_blank_mode(&self.fd, BlankMode::Unblank)?;

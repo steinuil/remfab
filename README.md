@@ -18,3 +18,8 @@ A (WIP) library to natively interact with the reMarkable 2 framebuffer.
 - https://www.kernel.org/doc/html/latest/fb/framebuffer.html
 - https://docs.rs/nix/latest/nix/sys/ioctl/
 - https://elixir.bootlin.com/linux/v6.17.9/source/include/uapi/linux/fb.h
+
+### .wbf format
+
+- https://github.com/aceisace/python-waveform-parser
+- https://github.com/fread-ink/inkwave

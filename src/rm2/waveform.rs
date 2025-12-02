@@ -3,7 +3,7 @@ use std::{
     ops::Index,
 };
 
-use crate::byte_reader::*;
+use crate::{byte_reader::*, rm2::checksum};
 
 #[derive(Debug, PartialEq, Eq)]
 pub struct Header {
@@ -118,18 +118,14 @@ fn header<R: Read + Seek>(input: &mut R) -> Result<Header, Error> {
 
 fn pointer<R: Read>(input: &mut R) -> Result<u32, Error> {
     let pointer = take_const(input)?;
-    let checksum = u8(input)?;
+    let expected_checksum = u8(input)?;
 
-    let actual: u8 = pointer[0]
-        .overflowing_add(pointer[1])
-        .0
-        .overflowing_add(pointer[2])
-        .0;
-    if actual != checksum {
+    let checksum = checksum::additive_checksum(pointer.iter());
+    if checksum != expected_checksum {
         return Err(Error::InvalidChecksum {
             field: "pointer".to_string(),
-            expected: checksum,
-            actual,
+            expected: expected_checksum,
+            actual: checksum,
         });
     }
 
@@ -139,16 +135,16 @@ fn pointer<R: Read>(input: &mut R) -> Result<u32, Error> {
 
 fn temperatures<R: Read>(count: usize, input: &mut R) -> Result<Vec<u8>, Error> {
     let temperatures = take(count + 2, input)?;
-    let _checksum = u8(input)?;
+    let expected_checksum = u8(input)?;
 
-    // TODO compute basic_checksum over the temperatures
-    // if actual != checksum {
-    //     return Err(nom::Err::Failure(Error::InvalidChecksum {
-    //         field: "temperatures".to_string(),
-    //         expected: checksum,
-    //         actual,
-    //     }));
-    // }
+    let checksum = checksum::additive_checksum(temperatures.iter());
+    if checksum != expected_checksum {
+        return Err(Error::InvalidChecksum {
+            field: "temperatures".to_string(),
+            expected: expected_checksum,
+            actual: checksum,
+        });
+    }
 
     Ok(temperatures)
 }
@@ -156,16 +152,16 @@ fn temperatures<R: Read>(count: usize, input: &mut R) -> Result<Vec<u8>, Error> 
 fn filename<R: Read>(input: &mut R) -> Result<Vec<u8>, Error> {
     let len = u8(input)?;
     let filename = take(len as usize, input)?;
-    let _checksum = u8(input)?;
+    let expected_checksum = u8(input)?;
 
-    // TODO compute basic_checksum over the filename
-    // if actual != checksum {
-    //     return Err(nom::Err::Failure(Error::InvalidChecksum {
-    //         field: "filename".to_string(),
-    //         expected: checksum,
-    //         actual,
-    //     }));
-    // }
+    let checksum = checksum::additive_checksum([len].iter().chain(filename.iter()));
+    if checksum != expected_checksum {
+        return Err(Error::InvalidChecksum {
+            field: "filename".to_string(),
+            expected: expected_checksum,
+            actual: checksum,
+        });
+    }
 
     Ok(filename)
 }
@@ -313,10 +309,13 @@ fn parse_pointer_test() {
 
 #[test]
 fn parse_test() {
-    use std::fs::File;
-    use std::io::SeekFrom;
+    use std::{
+        fs::File,
+        io::{BufReader, SeekFrom},
+    };
 
-    let mut input = File::open("320_R467_AF4731_ED103TC2C6_VB3300-KCD_TC.wbf").unwrap();
+    let mut input =
+        BufReader::new(File::open("320_R467_AF4731_ED103TC2C6_VB3300-KCD_TC.wbf").unwrap());
 
     let header = header(&mut input).unwrap();
     let temperatures = temperatures(header.temp_range_count as usize, &mut input).unwrap();

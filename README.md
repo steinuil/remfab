@@ -23,3 +23,4 @@ A (WIP) library to natively interact with the reMarkable 2 framebuffer.
 
 - https://github.com/aceisace/python-waveform-parser
 - https://github.com/fread-ink/inkwave
+- https://github.com/zephray/NekoInk/blob/master/utils/wbf_waveform_dump/main.c

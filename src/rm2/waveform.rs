@@ -1,4 +1,5 @@
 use std::{
+    collections::HashMap,
     io::{self, Read, Seek},
     ops::Index,
 };
@@ -6,14 +7,27 @@ use std::{
 use crate::{byte_reader::*, rm2::checksum};
 
 #[derive(Debug, PartialEq, Eq)]
-pub struct Header {
+struct Header {
+    /// CRC32 checksum calculated on the entire file.
     pub checksum: u32,
+
+    /// File length in bytes
     pub filesize: u32,
+
+    /// Unique value assigned to each waveform file.
     pub serial: u32,
+
+    /// Represents the type of FPL runs.
     pub run_type: u8,
+
     pub fpl_platform: u8,
+
+    /// FPL lot number.
     pub fpl_lot: u16,
+
+    /// Mode version in the documentation?
     pub adhesive_run: u8,
+
     pub waveform_version: u8,
     pub waveform_subversion: u8,
     pub waveform_type: u8,
@@ -34,6 +48,19 @@ pub struct Header {
     pub eb: u8,
     pub sb: u8,
     pub checksum2: u8,
+}
+
+#[repr(u8)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Mode {
+    INIT = 0,
+    DU = 1,
+    GC16 = 2,
+    GL16 = 3,
+    GLR16 = 4,
+    GLD16 = 5,
+    A2 = 6,
+    DU4 = 7,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -170,24 +197,28 @@ fn find_waveform_blocks<R: Read + Seek>(
     mode_count: usize,
     temperatures_count: usize,
     input: &mut R,
-) -> Result<Vec<u32>, Error> {
-    let mut addresses = vec![];
+) -> Result<Vec<Vec<u32>>, Error> {
+    let mut modes = vec![];
 
     let start = input.seek(io::SeekFrom::Current(0))?;
 
     for i in 0..mode_count + 1 {
         let offset = pointer(input)?;
 
+        let mut blocks = vec![];
+
         input.seek(io::SeekFrom::Start(offset as u64))?;
         for _ in 0..temperatures_count + 1 {
             let address = pointer(input)?;
 
-            addresses.push(address);
+            blocks.push(address);
         }
         input.seek(io::SeekFrom::Start(start + (i as u64 * 4)))?;
+
+        modes.push(blocks);
     }
 
-    Ok(addresses)
+    Ok(modes)
 }
 
 #[repr(u8)]
@@ -238,7 +269,9 @@ const INTENSITY_VALUES: usize = 1 << 5;
 
 type PhaseMatrix = Box<[[Phase; INTENSITY_VALUES]; INTENSITY_VALUES]>;
 
-fn waveform<R: Read + Seek>(end: u64, input: &mut R) -> Result<Vec<PhaseMatrix>, Error> {
+type Waveform = Vec<PhaseMatrix>;
+
+fn waveform<R: Read>(length: u64, input: &mut R) -> Result<Waveform, Error> {
     let mut block = vec![];
 
     let mut matrix = Box::new([[Phase::Noop; INTENSITY_VALUES]; INTENSITY_VALUES]);
@@ -247,13 +280,11 @@ fn waveform<R: Read + Seek>(end: u64, input: &mut R) -> Result<Vec<PhaseMatrix>,
     let mut j = 0;
     let mut repeat_mode = true;
 
-    loop {
-        let pos = input.seek(io::SeekFrom::Current(0))?;
-        if pos == end {
-            break;
-        }
+    let mut bytes_read = 0;
 
+    while bytes_read < length {
         let phases = u8(input)?;
+        bytes_read += 1;
 
         if phases == 0xFC {
             repeat_mode = !repeat_mode;
@@ -268,6 +299,7 @@ fn waveform<R: Read + Seek>(end: u64, input: &mut R) -> Result<Vec<PhaseMatrix>,
 
         if repeat_mode {
             repeat = u8(input)? as u32 + 1;
+            bytes_read += 1;
         }
 
         let phase_cell = PhaseCell::new(phases)?;
@@ -296,6 +328,80 @@ fn waveform<R: Read + Seek>(end: u64, input: &mut R) -> Result<Vec<PhaseMatrix>,
     Ok(block)
 }
 
+fn parse_waveforms<R: Read + Seek>(
+    blocks: Vec<Vec<u32>>,
+    header: &Header,
+    input: &mut R,
+) -> Result<Vec<Vec<Waveform>>, Error> {
+    let lengths: HashMap<u32, u32> = {
+        let mut blocks: Vec<u32> = blocks.iter().flat_map(|ptrs| ptrs).copied().collect();
+        blocks.sort();
+        blocks.push(header.filesize);
+
+        blocks.windows(2).map(|ps| (ps[0], ps[1])).collect()
+    };
+
+    let mut waveforms_by_mode = Vec::with_capacity(blocks.len());
+
+    for pointers in blocks.iter() {
+        let mut waveforms = Vec::with_capacity(pointers.len());
+
+        for pointer in pointers.iter() {
+            input.seek(io::SeekFrom::Start(*pointer as u64))?;
+            let length = lengths[pointer];
+            waveforms.push(waveform(length as u64, input)?);
+        }
+
+        waveforms_by_mode.push(waveforms);
+    }
+
+    Ok(waveforms_by_mode)
+}
+
+#[derive(Debug)]
+pub struct Table {
+    pub frame_rate: u8,
+    temperatures: Vec<u8>,
+    waveforms: Vec<Vec<Waveform>>,
+}
+
+impl Table {
+    pub fn parse<R: Read + Seek>(input: &mut R) -> Result<Table, Error> {
+        let header = header(input)?;
+        let temperatures = temperatures(header.temp_range_count as usize, input)?;
+        filename(input)?;
+        let blocks = find_waveform_blocks(
+            header.mode_count as usize,
+            header.temp_range_count as usize,
+            input,
+        )?;
+
+        let waveforms = parse_waveforms(blocks, &header, input)?;
+
+        Ok(Table {
+            frame_rate: if header.frame_rate == 0 {
+                85
+            } else {
+                header.frame_rate
+            },
+            temperatures,
+            waveforms,
+        })
+    }
+
+    pub fn lookup(&self, mode: Mode, temperature: u8) -> Option<&Waveform> {
+        let waveforms_by_temp = &self.waveforms[mode as usize];
+
+        for (i, temp) in self.temperatures.iter().enumerate().rev() {
+            if temperature < *temp {
+                return Some(&waveforms_by_temp[i - 1]);
+            }
+        }
+
+        None
+    }
+}
+
 #[test]
 fn parse_pointer_test() {
     use std::io::Cursor;
@@ -309,30 +415,30 @@ fn parse_pointer_test() {
 
 #[test]
 fn parse_test() {
-    use std::{
-        fs::File,
-        io::{BufReader, SeekFrom},
-    };
+    use std::{fs::File, io::BufReader};
 
     let mut input =
         BufReader::new(File::open("320_R467_AF4731_ED103TC2C6_VB3300-KCD_TC.wbf").unwrap());
 
-    let header = header(&mut input).unwrap();
-    let temperatures = temperatures(header.temp_range_count as usize, &mut input).unwrap();
-    let filename = filename(&mut input).unwrap();
-    let blocks = find_waveform_blocks(
-        header.mode_count as usize,
-        header.temp_range_count as usize,
-        &mut input,
-    )
-    .unwrap();
+    let x = Table::parse(&mut input).unwrap();
 
-    input.seek(SeekFrom::Start(blocks[0] as u64)).unwrap();
-    let end = blocks[1] as u64;
-    let waveform = waveform(end, &mut input).unwrap();
+    // let header = header(&mut input).unwrap();
+    // let temperatures = temperatures(header.temp_range_count as usize, &mut input).unwrap();
+    // let filename = filename(&mut input).unwrap();
+    // let blocks = find_waveform_blocks(
+    //     header.mode_count as usize,
+    //     header.temp_range_count as usize,
+    //     &mut input,
+    // )
+    // .unwrap();
 
-    println!("{:?}", waveform.last().unwrap());
-    println!("{:#?}", waveform.len());
+    // parse_waveforms(blocks, &header, &mut input).unwrap();
+
+    println!("{:#?}", x.temperatures);
+
+    // let length = (blocks[1] - blocks[0]) as u64;
+    // input.seek(SeekFrom::Start(blocks[0] as u64)).unwrap();
+    // let waveform = waveform(length, &mut input).unwrap();
 
     assert!(false);
 }

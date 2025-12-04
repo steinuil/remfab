@@ -55,12 +55,12 @@ struct Header {
 pub enum Mode {
     INIT = 0,
     DU = 1,
+    DU4 = 7,
     GC16 = 2,
     GL16 = 3,
     GLR16 = 4,
     GLD16 = 5,
     A2 = 6,
-    DU4 = 7,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -230,7 +230,7 @@ pub enum Phase {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct PhaseCell(u8);
+struct PhaseCell(u8);
 
 impl PhaseCell {
     pub fn new(phases: u8) -> Result<Self, Error> {
@@ -392,7 +392,7 @@ impl Table {
     pub fn lookup(&self, mode: Mode, temperature: u8) -> Option<&Waveform> {
         let waveforms_by_temp = &self.waveforms[mode as usize];
 
-        for (i, temp) in self.temperatures.iter().enumerate().rev() {
+        for (i, temp) in self.temperatures.iter().enumerate() {
             if temperature < *temp {
                 return Some(&waveforms_by_temp[i - 1]);
             }
@@ -411,34 +411,4 @@ fn parse_pointer_test() {
     let p = pointer(&mut input).unwrap();
 
     assert_eq!(p, 0x060505);
-}
-
-#[test]
-fn parse_test() {
-    use std::{fs::File, io::BufReader};
-
-    let mut input =
-        BufReader::new(File::open("320_R467_AF4731_ED103TC2C6_VB3300-KCD_TC.wbf").unwrap());
-
-    let x = Table::parse(&mut input).unwrap();
-
-    // let header = header(&mut input).unwrap();
-    // let temperatures = temperatures(header.temp_range_count as usize, &mut input).unwrap();
-    // let filename = filename(&mut input).unwrap();
-    // let blocks = find_waveform_blocks(
-    //     header.mode_count as usize,
-    //     header.temp_range_count as usize,
-    //     &mut input,
-    // )
-    // .unwrap();
-
-    // parse_waveforms(blocks, &header, &mut input).unwrap();
-
-    println!("{:#?}", x.temperatures);
-
-    // let length = (blocks[1] - blocks[0]) as u64;
-    // input.seek(SeekFrom::Start(blocks[0] as u64)).unwrap();
-    // let waveform = waveform(length, &mut input).unwrap();
-
-    assert!(false);
 }
